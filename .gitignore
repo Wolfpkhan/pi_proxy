@@ -1,0 +1,5 @@
+# 软链到全局 pi 包（ESM 解析所需，不入库）
+node_modules/
+
+# 日志
+*.log
