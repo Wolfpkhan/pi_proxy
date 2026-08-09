@@ -1,42 +1,73 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-# start-pi-proxy.sh — 启动 pi-proxy（OpenAI 兼容的 pi agent 服务）
+# start-pi-proxy.sh — 启动/自愈 pi-proxy（pi agent → OpenAI 兼容服务）
 #
-# 用 tmux 常驻会话运行（脱离当前 shell 信号，最稳定）。
-# 启动后：
-#   服务地址: http://127.0.0.1:8988/v1
-#   App 设置里把 baseUrl 改成这个即可接入 pi 的 agent 能力（工具调用/会话/技能）
+# 特性：
+#   • 幂等：已在运行则跳过
+#   • 等待依赖：llm-wire(8989) 就绪后才启动
+#   • 健康检查：启动后轮询 /v1/models 确认可用
+#   • wake-lock：防止 Android 休眠冻结
+#   • 独立进程组(setsid)：脱离当前 shell 信号，长服务保活
 #
-# 工作目录: ~/code/voice-assistant-workspace （agent 的 read/bash 作用域）
-# 模型: llm-wire 的 deepseek/deepseek-v4-flash
-# 会话: 内存单会话（重启即新对话）
+# 用法：
+#   bash start-pi-proxy.sh        # 手动启动
+#   （也由 ~/.termux/boot/start-pi-proxy.sh 开机自启调用）
 #
-# 查看: tmux attach -t piproxy   (Ctrl+B D 退出)
-# 停止: bash stop-pi-proxy.sh    或  pkill -9 -f pi-proxy.mjs
+# 服务地址: http://127.0.0.1:8988/v1
+# 日志: ~/pi-proxy.log
+# 停止: pkill -9 -f pi-proxy.mjs
 # ============================================================
-set -euo pipefail
+set -uo pipefail
 
-SESSION="piproxy"
+PORT=8988
+HOST="127.0.0.1"
+PROXY_SCRIPT="$HOME/code/pi-proxy/pi-proxy.mjs"
+LOG_FILE="$HOME/pi-proxy.log"
+PID_FILE="$HOME/code/pi-proxy/.pi-proxy.pid"
 
-# 已在运行则提示
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "✓ pi-proxy 已在运行 (tmux 会话: $SESSION)"
-    echo "  服务: http://127.0.0.1:8988/v1"
-    echo "  查看: tmux attach -t $SESSION"
+# ---------- 0. 幂等：已在运行则跳过 ----------
+if curl -s -m 2 "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+    echo "✓ pi-proxy 已在运行 (端口 $PORT)"
     exit 0
 fi
 
-echo "启动 pi-proxy (tmux 会话: $SESSION)..."
-tmux new-session -d -s "$SESSION" -x 200 -y 50 "node ~/code/pi-proxy/pi-proxy.mjs; echo '=== proxy 已退出，按任意键关闭 ==='; read -n1"
-sleep 7
+# ---------- 1. 防止 Android 休眠 ----------
+termux-wake-lock 2>/dev/null || true
 
-if curl -s -m 3 http://127.0.0.1:8988/v1/models >/dev/null 2>&1; then
-    echo "✓ 已启动: http://127.0.0.1:8988/v1"
-    echo "  App 设置 → baseUrl = http://127.0.0.1:8988/v1"
-    echo "  实时查看: tmux attach -t $SESSION  (Ctrl+B D 退出)"
-    echo "  日志文件: tail -f ~/pi-proxy.log"
-else
-    echo "✗ 启动失败，查看会话:"
-    tmux capture-pane -t "$SESSION" -p 2>/dev/null | tail -15
-    exit 1
-fi
+# ---------- 2. 清理残留进程/僵尸 ----------
+pkill -9 -f pi-proxy.mjs 2>/dev/null
+sleep 1
+
+# ---------- 3. 等待依赖 llm-wire(8989) 就绪（最多 30s） ----------
+echo "等待 llm-wire (端口 8989) 就绪..."
+for i in $(seq 1 15); do
+    if curl -s -m 2 "http://127.0.0.1:8989/v1/models" >/dev/null 2>&1; then
+        echo "✓ llm-wire 就绪"
+        break
+    fi
+    [ "$i" -eq 15 ] && { echo "✗ llm-wire 未就绪，pi-proxy 无法启动（先启动 llm-wire）"; exit 1; }
+    sleep 2
+done
+
+# ---------- 4. 启动 pi-proxy（独立进程组，脱离 shell 信号） ----------
+echo "启动 pi-proxy..."
+: > "$LOG_FILE"
+cd "$(dirname "$PROXY_SCRIPT")"
+setsid bash -c "node '$PROXY_SCRIPT' >> '$LOG_FILE' 2>&1" &
+PROXY_PID=$!
+echo "$PROXY_PID" > "$PID_FILE"
+
+# ---------- 5. 健康检查：轮询 /v1/models（最多 30s） ----------
+echo "等待 pi-proxy 就绪..."
+for i in $(seq 1 15); do
+    if curl -s -m 2 "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+        echo "✓ pi-proxy 已启动: http://$HOST:$PORT/v1 (PID $PROXY_PID)"
+        echo "  日志: tail -f $LOG_FILE"
+        exit 0
+    fi
+    sleep 2
+done
+
+echo "✗ pi-proxy 启动失败，查看日志: $LOG_FILE"
+tail -10 "$LOG_FILE"
+exit 1
