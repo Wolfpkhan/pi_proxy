@@ -3,3 +3,4 @@ node_modules/
 
 # 日志
 *.log
+.pi-proxy.pid
