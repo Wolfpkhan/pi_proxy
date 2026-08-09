@@ -20,7 +20,7 @@
  */
 
 import http from "node:http";
-import { createAgentSession, AuthStorage, ModelRegistry } from "@mariozechner/pi-coding-agent";
+import { createAgentSession, AuthStorage, ModelRegistry, SessionManager } from "@mariozechner/pi-coding-agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -29,25 +29,40 @@ const HOST = "127.0.0.1";
 const CWD = join(homedir(), "code", "voice-assistant-workspace");
 const TARGET_MODEL = { provider: "llm-wire", id: "deepseek/deepseek-v4-flash" };
 
-// ---------- 1. 初始化 pi agent 会话 ----------
+// ---------- 1. pi agent 会话管理（默认 continueRecent，可手动新对话） ----------
 const authStorage = AuthStorage.create();
 const modelRegistry = ModelRegistry.create(authStorage);
+const TARGET_MODEL_OBJ = modelRegistry.find(TARGET_MODEL.provider, TARGET_MODEL.id);
+if (!TARGET_MODEL_OBJ) {
+	console.error(`[pi-proxy] 找不到模型 ${TARGET_MODEL.provider}/${TARGET_MODEL.id}`);
+	process.exit(1);
+}
 
 let session;
-try {
-	const model = modelRegistry.find(TARGET_MODEL.provider, TARGET_MODEL.id);
-	if (!model) throw new Error(`找不到模型 ${TARGET_MODEL.provider}/${TARGET_MODEL.id}，请检查 ~/.pi/agent/models.json`);
+let unsubscribeActive = null;  // 当前会话的事件订阅（重建时先取消）
+
+/** (重新)创建会话。newOne=true 开新 session，否则 continueRecent 接着最近会话。 */
+async function initSession(newOne = false) {
+	// 取消旧会话订阅并释放
+	if (unsubscribeActive) { try { unsubscribeActive(); } catch {} unsubscribeActive = null; }
+	if (session) { try { session.dispose(); } catch {} }
 	const res = await createAgentSession({
-		model,
+		model: TARGET_MODEL_OBJ,
 		cwd: CWD,
-		// 保留完整工具集，agent 能 read/bash/edit/grep 等；工具静默由 proxy 端事件过滤实现
+		// 保留完整工具集：agent 能 read/bash/edit/grep 等，可搜历史 session 文件
 		tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 		authStorage,
 		modelRegistry,
-		// 不持久化会话文件，纯内存单会话（重启即新对话，适合语音助手）
+		// ★ 持久化：默认接着最近会话（continueRecent）；新对话用 create
+		sessionManager: newOne ? SessionManager.create(CWD) : SessionManager.continueRecent(CWD),
 	});
 	session = res.session;
-	console.error(`[pi-proxy] 会话就绪: model=${model.provider}/${model.id}, cwd=${CWD}`);
+	console.error(`[pi-proxy] 会话就绪(${newOne ? "新对话" : "接着最近"}): ${session.sessionId}, file=${session.sessionFile ?? "(无)"}`);
+}
+
+// 启动时创建会话
+try {
+	await initSession(false);
 } catch (e) {
 	console.error(`[pi-proxy] 初始化失败: ${e.message}`);
 	process.exit(1);
@@ -159,6 +174,19 @@ const server = http.createServer(async (req, res) => {
 			return;
 		}
 		await handleChat(res, body);
+		return;
+	}
+
+	// ★ 新对话：重建 session（新 session 文件，旧会话保留供 grep 检索）
+	if (req.method === "POST" && (req.url === "/v1/new-session" || req.url === "/new-session")) {
+		try {
+			await initSession(true);
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(JSON.stringify({ ok: true, sessionId: session.sessionId }));
+		} catch (e) {
+			res.writeHead(500, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: { message: e.message } }));
+		}
 		return;
 	}
 
