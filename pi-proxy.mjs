@@ -190,6 +190,28 @@ const server = http.createServer(async (req, res) => {
 		return;
 	}
 
+	// ★ 中断当前 agent 运行：调用 session.abort() 停止 pi 端正在执行的 agent run
+	//   场景：App 发出新请求但 pi session 还在跑上一个任务（Agent is already processing）
+	//   → 客户端可调此接口强制中断老任务，让新请求能继续
+	if (req.method === "POST" && (req.url === "/v1/abort" || req.url === "/abort")) {
+		try {
+			if (session && typeof session.abort === "function") {
+				session.abort();
+				console.error(`[pi-proxy] 收到 /v1/abort，已调用 session.abort()`);
+				res.writeHead(200, { "content-type": "application/json" });
+				res.end(JSON.stringify({ ok: true, aborted: true }));
+			} else {
+				res.writeHead(400, { "content-type": "application/json" });
+				res.end(JSON.stringify({ error: { message: "session 未初始化或不支持 abort" } }));
+			}
+		} catch (e) {
+			console.error("[pi-proxy] /v1/abort 失败:", e.message);
+			res.writeHead(500, { "content-type": "application/json" });
+			res.end(JSON.stringify({ error: { message: e.message } }));
+		}
+		return;
+	}
+
 	// 其它路径：简单 404
 	res.writeHead(404, { "content-type": "application/json" });
 	res.end(JSON.stringify({ error: { message: `Not Found: ${req.url}` } }));
