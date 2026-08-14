@@ -84,6 +84,22 @@ function sseChunk(delta) {
 	};
 	return `data: ${JSON.stringify(payload)}\n\n`;
 }
+
+/** ★ 思考过程 chunk（delta 用 { reasoning_content: ... }，与 DeepSeek API 一致）。 */
+function sseReasoningChunk(reasoning) {
+	const payload = {
+		id: "chatcmpl-pi",
+		object: "chat.completion.chunk",
+		created: Math.floor(Date.now() / 1000),
+		model: "deepseek-v4-flash",
+		choices: [{
+			index: 0,
+			delta: { reasoning_content: reasoning },
+			finish_reason: null,
+		}],
+	};
+	return `data: ${JSON.stringify(payload)}\n\n`;
+}
 const SSE_DONE = "data: [DONE]\n\n";
 
 /** 处理一次 /v1/chat/completions 请求：把 OpenAI messages → pi prompt，pi 事件 → OpenAI SSE。 */
@@ -116,8 +132,13 @@ async function handleChat(res, body) {
 		try {
 			if (event.type === "message_update") {
 				const ae = event.assistantMessageEvent;
+				// ★ 正文流式（text_delta）
 				if (ae && ae.type === "text_delta" && ae.delta) {
 					res.write(sseChunk(ae.delta));
+				}
+				// ★ 思考过程流式（thinking_delta）— DeepSeek 风格：delta.reasoning_content
+				else if (ae && ae.type === "thinking_delta" && ae.delta) {
+					res.write(sseReasoningChunk(ae.delta));
 				}
 				// tool_execution_* / thinking_* 等事件全部静默忽略
 			} else if (event.type === "agent_end") {
