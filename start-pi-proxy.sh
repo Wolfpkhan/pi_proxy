@@ -19,8 +19,21 @@
 # ============================================================
 set -uo pipefail
 
+# ---------- 从 config.json 读 server.port / server.host（无 jq 依赖，用 node） ----------
+# 字段缺失时 fallback 到下方硬编码默认值
+PROXY_CONFIG="$HOME/code/pi-proxy/config.json"
 PORT=8988
 HOST="127.0.0.1"
+if [ -f "$PROXY_CONFIG" ] && command -v node >/dev/null 2>&1; then
+	read -r _PORT _HOST < <(node -e "
+		const cfg = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf-8'));
+		const port = (cfg.server && Number.isInteger(cfg.server.port)) ? cfg.server.port : 8988;
+		const host = (cfg.server && typeof cfg.server.host === 'string') ? cfg.server.host : '127.0.0.1';
+		process.stdout.write(port + ' ' + host);
+	" "$PROXY_CONFIG" 2>/dev/null) && [ -n "$_PORT" ] && { PORT="$_PORT"; HOST="$_HOST"; }
+fi
+echo "[pi-proxy] 使用端口 ${HOST}:${PORT} (来源: $([ -f "$PROXY_CONFIG" ] && echo config.json || echo 默认值))"
+
 PROXY_SCRIPT="$HOME/code/pi-proxy/pi-proxy.mjs"
 LOG_FILE="$HOME/pi-proxy.log"
 PID_FILE="$HOME/code/pi-proxy/.pi-proxy.pid"

@@ -1,0 +1,22 @@
+{
+  "_comment": "pi-proxy 配置。修改后重启 pi-proxy（pkill -9 -f pi-proxy.mjs && start-pi-proxy.sh）生效。字段缺失时使用下方默认值（向后兼容）。",
+  "tools": [
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "cron"
+  ],
+  "model": {
+    "provider": "llm-wire",
+    "id": "deepseek/deepseek-v4-flash"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8988
+  },
+  "cwd": "~/code/voice-assistant-workspace"
+}
