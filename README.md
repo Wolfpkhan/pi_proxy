@@ -4,6 +4,8 @@
 
 Wraps the agent capabilities of [pi](https://github.com/mariozechner/pi-coding-agent) (tool calls, skills, sessions) into an **OpenAI-compatible API** — so any OpenAI client gets a full local agent behind `POST /v1/chat/completions`. Built as the LLM backend of my [sherpa voice assistant](https://github.com/Wolfpkhan/voice_assistant) on Android/Termux.
 
+> 🔌 **The protocol is open — pi-proxy is just one reference implementation.** If it doesn't fit your stack, implement your own proxy in any language following [PROTOCOL.md](./PROTOCOL.md): a minimal compatible proxy is ~150 lines. See the implementation checklist below (English section).
+
 > 🙏 **Special thanks to the [sherpa project](https://github.com/k2-fsa/sherpa-onnx)** ([k2-fsa](https://github.com/k2-fsa)) — its on-device speech stack (VAD/ASR/TTS) powers the offline voice pipeline of the companion app this proxy serves. The whole "talk to a local agent by voice on a phone" experience stands on sherpa-onnx.
 
 ---
@@ -11,6 +13,8 @@ Wraps the agent capabilities of [pi](https://github.com/mariozechner/pi-coding-a
 ## 中文
 
 把 [pi](https://github.com/mariozechner/pi-coding-agent) 的 agent 能力（工具调用、技能、会话）包装成 **OpenAI 兼容 API**——任何 OpenAI 客户端指向它，就获得一个能在 Termux 里跑工具、带持久会话的本地 agent。它是我的 [sherpa 语音助手](https://github.com/Wolfpkhan/voice_assistant)的 LLM 后端。
+
+> 🔌 **协议是开放的——pi-proxy 只是参考实现之一。** 不适合你的技术栈？用任何语言按 [PROTOCOL.md](./PROTOCOL.md) 自行实现一个兼容代理即可（最小实现约 150 行），见下方[接口清单](#实现你自己的兼容代理)。App/客户端不绑定本实现。
 
 > 🙏 **特别感谢 [sherpa 项目](https://github.com/k2-fsa/sherpa-onnx)**（[k2-fsa](https://github.com/k2-fsa)）——本代理所服务的语音 App，其离线语音链路（VAD/ASR/TTS）完全由 sherpa-onnx 驱动。"在手机上用语音指挥本地 agent"这套体验建立在 sherpa-onnx 之上。
 
@@ -40,6 +44,28 @@ Wraps the agent capabilities of [pi](https://github.com/mariozechner/pi-coding-a
 - **图片附件**：多模态 content（`image_url`，data URL 或 http URL）。默认 `materialize` 模式：图片落盘为文件 + 在 prompt 里告知路径并提示 agent 用 `mmx vision describe` 识图——**不依赖 vision LLM**；也可切 `passthrough` 透传给 vision LLM
 - **多模型**：config 指定 provider/model（走 pi 的模型注册，llm-wire/deepseek/minimax 等任选）
 - **专用工作目录**：agent 的 read/bash 作用域可配置（`cwd`）
+
+### 实现你自己的兼容代理
+
+客户端（App）只认 **OpenAI 兼容接口**，不绑定 pi-proxy。任何语言、任何后端（另一个 agent 框架、自家微服务、甚至直接包一个云端 vision LLM）只要实现以下接口即可无缝替换：
+
+| 接口 | 必要性 | 说明 |
+|------|--------|------|
+| `POST /v1/chat/completions`（`stream:true`，SSE） | ★ 必须 | 核心端点。首帧 `role:assistant` 立即发；增量 `delta.content`；终帧 `finish_reason` + `[DONE]` |
+| `GET /v1/models` | ★ 必须 | 连通性探测，返回模型列表 JSON |
+| 断连即中断 | ★ 必须 | 客户端断开 SSE → 停止生成/abort 后端（OpenAI 官方语义，否则残留运行中的 agent 会阻塞下一请求） |
+| 错误格式 | ★ 必须 | `{"error":{"message","type","code"}}` + 标准状态码 |
+| `POST /v1/new-session` | ⚡ 扩展（推荐） | App 点「新对话」时调用；不支持则返回 404，App 静默忽略（无 session 概念的服务端不需要） |
+| `delta.reasoning_content` | ○ 可选 | 思考链流式；App 渲染为可折叠的思考区 |
+| `delta.tool_calls`（增量） | ○ 可选 | 工具调用可视化；首帧带 `id`/`name`，后续 `arguments` 增量 |
+| SSE 注释行 `: [tool_start]` / `: [tool_end]` | ○ 可选 | 工具执行状态反馈；标准 OpenAI 客户端自动忽略，不影响兼容性 |
+| 多模态 content（`image_url`） | ○ 可选 | 图片附件：data URL 或 http URL，客户端已压缩好 |
+
+完整规范（帧格式、测试清单、设计动机）见 **[PROTOCOL.md](./PROTOCOL.md)**。最小实现参考：
+
+- 输入：取 `messages` 里最后一条 user 消息作为新 prompt（服务端自管历史）
+- 输出：`role` 首帧 → `content` 增量帧 → `finish_reason` 终帧 → `[DONE]`
+- 流式响应加 `Cache-Control: no-cache` + `x-accel-buffering: no`（防反代缓冲）
 
 ### 使用
 
@@ -141,6 +167,28 @@ Zero client changes: any OpenAI-compatible client just sets `baseUrl` to `http:/
 - **Image attachments**: multimodal content (`image_url`, data URL or http URL). Default `materialize` mode saves images to files and hints the agent to use `mmx vision describe` — **no vision LLM required**; switch to `passthrough` to forward to a vision LLM
 - **Any model**: provider/model set in config (via pi's registry — llm-wire/deepseek/minimax...)
 - **Sandboxed workspace**: agent read/bash scope configurable via `cwd`
+
+### Implement Your Own Compatible Proxy
+
+The client (the app) only speaks the **OpenAI-compatible interface** — it is not tied to pi-proxy. Any language, any backend (another agent framework, your own microservice, or even a plain wrapper over a cloud LLM) can be a drop-in replacement as long as it implements:
+
+| Interface | Required? | Notes |
+|---|---|---|
+| `POST /v1/chat/completions` (`stream:true`, SSE) | ★ required | The core endpoint. Send `role:assistant` immediately; stream `delta.content`; end with `finish_reason` + `[DONE]` |
+| `GET /v1/models` | ★ required | Connectivity probe, returns a model list JSON |
+| Disconnect = abort | ★ required | Client SSE disconnect → stop generation / abort the backend (official OpenAI semantics; otherwise a leftover agent run blocks the next request) |
+| Error format | ★ required | `{"error":{"message","type","code"}}` + standard status codes |
+| `POST /v1/new-session` | ⚡ extension (recommended) | Fired when the user taps “New chat”; return 404 if unsupported — the client silently ignores it (stateless servers don't need it) |
+| `delta.reasoning_content` | ○ optional | Chain-of-thought streaming; rendered as a collapsible thinking section |
+| `delta.tool_calls` (incremental) | ○ optional | Tool-call visualization; first frame carries `id`/`name`, later frames carry `arguments` deltas |
+| SSE comment lines `: [tool_start]` / `: [tool_end]` | ○ optional | Tool execution status; standard OpenAI clients ignore them automatically |
+| Multimodal content (`image_url`) | ○ optional | Image attachments: data URL or http URL, already compressed by the client |
+
+Full spec (frame formats, testing checklist, design rationale): **[PROTOCOL.md](./PROTOCOL.md)**. Minimal-implementation notes:
+
+- Input: take the last `user` message as the new prompt (the server manages its own history)
+- Output: `role` first frame → incremental `content` frames → `finish_reason` final frame → `[DONE]`
+- Add `Cache-Control: no-cache` + `x-accel-buffering: no` to streaming responses (prevents reverse-proxy buffering)
 
 ### Usage
 
