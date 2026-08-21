@@ -12,11 +12,14 @@
   ],
   "model": {
     "provider": "llm-wire",
-    "id": "deepseek/deepseek-v4-flash"
+    "id": "minimax/minimax-m3"
   },
   "server": {
     "host": "127.0.0.1",
     "port": 8988
   },
-  "cwd": "~/code/voice-assistant-workspace"
+  "cwd": "~/code/voice-assistant-workspace",
+  "images": {
+    "hintSingle": "\n\n🖼️ ATTACHED: {path}\n→ mmx vision describe --image {path}"
+  }
 }

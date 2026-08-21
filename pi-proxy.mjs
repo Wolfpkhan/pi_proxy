@@ -34,6 +34,19 @@ const DEFAULT_CONFIG = {
 	model: { provider: "llm-wire", id: "deepseek/deepseek-v4-flash" },
 	server: { host: "127.0.0.1", port: 8988 },
 	cwd: join(homedir(), "code", "voice-assistant-workspace"),
+	// ★ 图片附件处理（pi-proxy 不依赖 vision LLM也能识图：落盘 + 提示 agent 调 mmx）
+	//   • mode: "materialize"（默认，保存为文件 + hint）/ "passthrough"（透明走 pi 的 images 参数，需 vision LLM）
+	//   • dir: 落盘目录
+	//   • hintTemplate: 追加到 userText 后的提示模板。占位符：
+	//       {single}    - 单个图片时的完整提示
+	//       {list}      - 多图时的列表形式提示
+	//   • 字段缺失时使用下面的默认值（向后兼容）
+	images: {
+		mode: "materialize",
+		dir: "/data/data/com.termux/files/usr/tmp/pi-proxy-images",
+		hintSingle: "\n\n[图片附件已保存: {path}。用 `mmx vision describe --image {path}` 识图（也可 read 查看）]",
+		hintMulti: "\n\n[图片附件已保存:\n{paths}\n用 mmx vision describe --image <路径> 逐个识图]",
+	},
 };
 
 /** 把 ~/foo 展开为 homedir()/foo（保留绝对路径原样）。*/
@@ -64,6 +77,15 @@ function loadProxyConfig() {
 		}
 		// cwd（支持 ~/xxx 简写）
 		if (typeof parsed.cwd === "string") cfg.cwd = expandHome(parsed.cwd);
+		// images（图片附件处理：mode/dir/hint 模板）
+		if (parsed.images && typeof parsed.images === "object") {
+			if (typeof parsed.images.mode === "string" && (parsed.images.mode === "materialize" || parsed.images.mode === "passthrough")) {
+				cfg.images.mode = parsed.images.mode;
+			}
+			if (typeof parsed.images.dir === "string") cfg.images.dir = expandHome(parsed.images.dir);
+			if (typeof parsed.images.hintSingle === "string") cfg.images.hintSingle = parsed.images.hintSingle;
+			if (typeof parsed.images.hintMulti === "string") cfg.images.hintMulti = parsed.images.hintMulti;
+		}
 	} catch (e) {
 		if (e.code !== "ENOENT") console.error("[pi-proxy] config.json 解析失败，使用默认值:", e.message);
 	}
@@ -217,18 +239,99 @@ function sseCommentToolEnd(toolName, toolCallId, isError) {
 /** 处理一次 /v1/chat/completions 请求：把 OpenAI messages → pi prompt，pi 事件 → OpenAI SSE。 */
 async function handleChat(res, body) {
 	// 取最后一条 user content 作为 prompt（pi 单会话自己管历史）
+	// ★ 支持 OpenAI 多模态：content 可以是 string 或 [{type:text|image_url|...}]。
+	//   text 部分拼接为 prompt 文本；image_url（data URL 或 http URL）转 pi 的
+	//   ImageContent（{type:"image", data, mimeType}）直接传给 session.prompt()。
+	//   其它类型（file/audio 等非标准扩展）忽略并打日志。
 	let userText = "";
+	let images = [];
 	try {
 		const msgs = body.messages || [];
 		for (let i = msgs.length - 1; i >= 0; i--) {
-			if (msgs[i].role === "user") { userText = typeof msgs[i].content === "string" ? msgs[i].content : ""; break; }
+			if (msgs[i].role !== "user") continue;
+			const c = msgs[i].content;
+			if (typeof c === "string") {
+				userText = c;
+			} else if (Array.isArray(c)) {
+				// 多模态：拼接 text 部分，提取 image_url
+				const textParts = [];
+				for (const part of c) {
+						if (part?.type === "text" && typeof part.text === "string") {
+							textParts.push(part.text);
+					} else if (part?.type === "image_url" && part.image_url?.url) {
+							const url = part.image_url.url;
+							const m = /^data:([^;,]+);base64,(.+)$/s.exec(url);
+							if (m) {
+								// data URL → base64 + mimeType（pi ImageContent 格式）
+								images.push({ type: "image", data: m[2], mimeType: m[1] });
+							} else if (/^https?:\/\//.test(url)) {
+								// http URL：先下载转 base64（vision LLM 需要数据，不是引用）
+								try {
+									const r = await fetch(url);
+									const buf = Buffer.from(await r.arrayBuffer());
+									images.push({ type: "image", data: buf.toString("base64"),
+										mimeType: r.headers.get("content-type")?.split(";")[0] || "image/jpeg" });
+								} catch (e) {
+										console.error(`[pi-proxy] 图片下载失败 ${url.slice(0, 60)}: ${e.message}`);
+								}
+							}
+						} else {
+							console.error(`[pi-proxy] 忽略未知 content part: ${part?.type}`);
+						}
+					}
+					userText = textParts.join("\n").trim();
+			}
+			break;
 		}
-	} catch {}
-	if (!userText) {
+	} catch (e) {
+		console.error("[pi-proxy] messages 解析异常:", e.message);
+	}
+	if (!userText && images.length === 0) {
 		res.writeHead(400, { "content-type": "application/json" });
 		res.end(JSON.stringify({ error: { message: "messages 中无 user content" } }));
 		return;
 	}
+	// ★ 支持两种识图路径（可配置：images.mode）：
+	//   • "materialize"（默认）：图片落盘为文件 + 在 prompt 里告知路径，agent 可用 mmx vision describe
+	//   • "passthrough"：原生透传 pi 的 prompt images 参数（需 vision LLM）
+	let tempFiles = [];
+	const imgCfg = PROXY_CONFIG.images;
+	const useNativeVision = imgCfg.mode === "passthrough";
+	async function materializeImages() {
+		if (images.length === 0 || useNativeVision) return;
+		const fs = await import("node:fs/promises");
+		const path = await import("node:path");
+		const dir = imgCfg.dir;
+		await fs.mkdir(dir, { recursive: true });
+		const paths = [];
+		for (let i = 0; i < images.length; i++) {
+			const img = images[i];
+			const ext = img.mimeType.includes("png") ? "png" : img.mimeType.includes("webp") ? "webp"
+				: img.mimeType.includes("gif") ? "gif" : "jpg";
+			const f = path.join(dir, `img-${Date.now()}-${i}.${ext}`);
+			try {
+				await fs.writeFile(f, Buffer.from(img.data, "base64"));
+				tempFiles.push(f);
+				paths.push(f);
+			} catch (e) {
+				console.error(`[pi-proxy] 图片落盘失败: ${e.message}`);
+			}
+		}
+		if (paths.length > 0) {
+			// ★ 提示模板从配置读取（可自定义）
+			const tmpl = paths.length === 1 ? imgCfg.hintSingle : imgCfg.hintMulti;
+			const replacement = paths.length === 1
+				? paths[0]
+				: paths.map(p => `- ${p}`).join("\n");
+			userText += tmpl
+				.replaceAll("{path}", paths[0] ?? "")
+				.replaceAll("{paths}", replacement)
+				.replaceAll("{single}", tmpl === imgCfg.hintSingle ? tmpl.replace("{path}", paths[0]) : "")
+				.replaceAll("{list}", replacement);
+		}
+		images = []; // 已落盘，不再透传
+	}
+	await materializeImages();
 
 	res.writeHead(200, {
 		"content-type": "text/event-stream",
@@ -237,7 +340,22 @@ async function handleChat(res, body) {
 		"x-accel-buffering": "no",
 	});
 	res.write(sseChunk(null)); // 首帧 role:assistant
-	console.error(`[pi-proxy] 收到请求 (prompt 长度=${userText.length}): "${userText.slice(0, 40)}"`);
+	console.error(`[pi-proxy] 收到请求 (prompt 长度=${userText.length}, 图片=${images.length}${tempFiles.length > 0 ? ", 落盘=" + tempFiles.length : ""}): "${userText.slice(0, 40)}"`);
+
+	// ★ 客户端断连检测（OpenAI 标准中断语义：断开连接 = 停止生成）
+	//   未完成时客户端断开（call.cancel()/关 EventSource/杀 App）→ abort pi agent。
+	//   这让代理完全 OpenAI 兼容——不再需要自定义 /v1/abort 接口。
+	//   注意区分：正常完成（agent_end → res.end()）也会触发 close，用 finished 标志分离。
+	let finished = false;
+	res.on("close", () => {
+		if (!finished && session && typeof session.abort === "function") {
+			try {
+				session.abort();
+				console.error(`[pi-proxy] 客户端断连（未完成）→ session.abort()`);
+			} catch {}
+		}
+		if (unsubscribe) { try { unsubscribe(); } catch {} unsubscribe = null; }
+	});
 
 	// 订阅 pi 事件：转 text/thinking/toolcall + message_end 的 finish_reason/usage + 工具执行注释
 	let unsubscribe = session.subscribe((event) => {
@@ -297,6 +415,7 @@ async function handleChat(res, body) {
 			else if (event.type === "agent_end") {
 				res.write(SSE_DONE);
 				res.end();
+				finished = true;
 				if (unsubscribe) { unsubscribe(); unsubscribe = null; }
 			}
 			else if (event.type === "extension_error") {
@@ -308,15 +427,21 @@ async function handleChat(res, body) {
 	});
 
 	try {
-		await session.prompt(userText);
+		await session.prompt(userText, images.length > 0 ? { images } : undefined);
 	} catch (e) {
 		console.error("[pi-proxy] prompt 失败:", e.message);
 		// 把错误作为一段文本吐出，保证流闭合
 		res.write(sseChunk(`（出错：${e.message}）`));
 		res.write(SSE_DONE);
 		res.end();
+		finished = true;
 	} finally {
 		if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+		// ★ 清理临时图片（agent 已处理完，避免堆积）
+		if (tempFiles.length > 0) {
+			const fs = await import("node:fs/promises");
+			for (const f of tempFiles) { try { await fs.unlink(f); } catch {} }
+		}
 	}
 }
 
@@ -352,40 +477,28 @@ const server = http.createServer(async (req, res) => {
 		return;
 	}
 
-	// ★ 新对话：重建 session（新 session 文件，旧会话保留供 grep 检索）
+	// ★ 扩展端点（可选，非 OpenAI 标准）：重置 agent session
+	//   场景：App 点“新对话”按钮 → 让 agent 从空白开始，不带前一会话历史
+	//   直连标准 OpenAI 服务的客户端会收到 404（无副作用，可忽略）
+	//   pi-proxy 类自维护 session 的代理实现此端点提供会话重置
 	if (req.method === "POST" && (req.url === "/v1/new-session" || req.url === "/new-session")) {
 		try {
 			await initSession(true);
+			console.error(`[pi-proxy] /v1/new-session: 重置 session → ${session.sessionId}`);
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end(JSON.stringify({ ok: true, sessionId: session.sessionId }));
 		} catch (e) {
+			console.error("[pi-proxy] /v1/new-session 失败:", e.message);
 			res.writeHead(500, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: { message: e.message } }));
 		}
 		return;
 	}
 
-	// ★ 中断当前 agent 运行：调用 session.abort() 停止 pi 端正在执行的 agent run
-	//   场景：App 发出新请求但 pi session 还在跑上一个任务（Agent is already processing）
-	//   → 客户端可调此接口强制中断老任务，让新请求能继续
-	if (req.method === "POST" && (req.url === "/v1/abort" || req.url === "/abort")) {
-		try {
-			if (session && typeof session.abort === "function") {
-				session.abort();
-				console.error(`[pi-proxy] 收到 /v1/abort，已调用 session.abort()`);
-				res.writeHead(200, { "content-type": "application/json" });
-				res.end(JSON.stringify({ ok: true, aborted: true }));
-			} else {
-				res.writeHead(400, { "content-type": "application/json" });
-				res.end(JSON.stringify({ error: { message: "session 未初始化或不支持 abort" } }));
-			}
-		} catch (e) {
-			console.error("[pi-proxy] /v1/abort 失败:", e.message);
-			res.writeHead(500, { "content-type": "application/json" });
-			res.end(JSON.stringify({ error: { message: e.message } }));
-		}
-		return;
-	}
+	res.writeHead(404, { "content-type": "application/json" });
+	res.end(JSON.stringify({ error: { message: `path ${req.url} not found` } }));
+
+
 
 	// 其它路径：简单 404
 	res.writeHead(404, { "content-type": "application/json" });
