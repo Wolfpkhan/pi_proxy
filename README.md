@@ -6,8 +6,6 @@ Wraps the agent capabilities of [pi](https://github.com/mariozechner/pi-coding-a
 
 > 🔌 **The protocol is open — pi-proxy is just one reference implementation.** If it doesn't fit your stack, implement your own proxy in any language following [PROTOCOL.md](./PROTOCOL.md): a minimal compatible proxy is ~150 lines. See the implementation checklist below (English section).
 
-> 🙏 **Special thanks to the [sherpa project](https://github.com/k2-fsa/sherpa-onnx)** ([k2-fsa](https://github.com/k2-fsa)) — its on-device speech stack (VAD/ASR/TTS) powers the offline voice pipeline of the companion app this proxy serves. The whole "talk to a local agent by voice on a phone" experience stands on sherpa-onnx.
->
 > 🙏 **Special thanks to the [pi project](https://github.com/mariozechner/pi-coding-agent)** ([mariozechner](https://github.com/mariozechner)) — this proxy is a thin OpenAI-compatible shell over pi's agent loop. All the real capabilities (tool calling, skills, sessions, compaction, multi-provider auth) come from pi. Without it, none of this exists.
 
 ---
@@ -18,8 +16,6 @@ Wraps the agent capabilities of [pi](https://github.com/mariozechner/pi-coding-a
 
 > 🔌 **协议是开放的——pi-proxy 只是参考实现之一。** 不适合你的技术栈？用任何语言按 [PROTOCOL.md](./PROTOCOL.md) 自行实现一个兼容代理即可（最小实现约 150 行），见下方[接口清单](#实现你自己的兼容代理)。App/客户端不绑定本实现。
 
-> 🙏 **特别感谢 [sherpa 项目](https://github.com/k2-fsa/sherpa-onnx)**（[k2-fsa](https://github.com/k2-fsa)）——本代理所服务的语音 App，其离线语音链路（VAD/ASR/TTS）完全由 sherpa-onnx 驱动。"在手机上用语音指挥本地 agent"这套体验建立在 sherpa-onnx 之上。
->
 > 🙏 **特别感谢 [pi 项目](https://github.com/mariozechner/pi-coding-agent)**（[mariozechner](https://github.com/mariozechner)）——本代理只是套在 pi agent loop 外面的一层薄薄的 OpenAI 兼容外壳。真正的能力全部来自 pi：工具调用、技能、会话持久化、compaction、多 provider 模型接入。没有 pi，就没有这个项目。
 
 ### 原理
